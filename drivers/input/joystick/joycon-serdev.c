@@ -135,6 +135,15 @@ static const u16 JC_CAL_USR_RIGHT_DATA_ADDR	= 0x801D;
 static const u16 JC_CAL_FCT_DATA_LEFT_ADDR	= 0x603d;
 static const u16 JC_CAL_FCT_DATA_RIGHT_ADDR	= 0x6046;
 
+/* SPI storage addresses of IMU factory calibration data */
+static const u16 JC_IMU_CAL_FCT_DATA_ADDR	= 0x6020;
+static const u16 JC_IMU_CAL_FCT_DATA_END	= 0x6037;
+static const u16 JC_IMU_CAL_DATA_SIZE		=
+	(JC_IMU_CAL_FCT_DATA_END - JC_IMU_CAL_FCT_DATA_ADDR + 1);
+/* SPI storage addresses of IMU user calibration data */
+static const u16 JC_IMU_CAL_USR_MAGIC_ADDR	= 0x8026;
+static const u16 JC_IMU_CAL_USR_DATA_ADDR	= 0x8028;
+
 /* The raw analog joystick values will be mapped in terms of this magnitude */
 static const u16 JC_MAX_STICK_MAG		= 32767;
 static const u16 JC_STICK_FUZZ			= 250;
@@ -395,6 +404,15 @@ struct joycon_subcmd_reply {
 	u8 data[0]; /* Will be at most 35 bytes */
 } __packed;
 
+struct joycon_imu_data {
+	s16 accel_x;
+	s16 accel_y;
+	s16 accel_z;
+	s16 gyro_x;
+	s16 gyro_y;
+	s16 gyro_z;
+} __packed;
+
 struct joycon_input_report {
 	u8 id;
 	u8 timer;
@@ -404,11 +422,11 @@ struct joycon_input_report {
 	u8 right_stick[3];
 	u8 vibrator_report;
 
-	/*
-	 * If support for firmware updates, gyroscope data, and/or NFC/IR
-	 * are added in the future, this can be swapped for a union.
-	 */
-	struct joycon_subcmd_reply reply;
+	union {
+		struct joycon_subcmd_reply reply;
+		/* IMU input reports contain 3 samples */
+		u8 imu_raw_bytes[sizeof(struct joycon_imu_data) * 3];
+	};
 } __packed;
 
 struct sio_uart_packet {
@@ -419,15 +437,6 @@ struct sio_uart_packet {
 	u8  crc_payload;
 	u8  crc_hdr;
 	u8  payload[];
-} __packed;
-
-struct joycon_imu_data {
-	s16 accel_x;
-	s16 accel_y;
-	s16 accel_z;
-	s16 gyro_x;
-	s16 gyro_y;
-	s16 gyro_z;
 } __packed;
 
 struct sio_input_report
@@ -1085,6 +1094,36 @@ static int joycon_enable_rumble(struct joycon_ctlr *ctlr, bool enable)
 	return joycon_send_subcmd(ctlr, req, 1, HZ/4);
 }
 
+/* Taken from hid-nintendo.c */
+static int joycon_set_report_mode(struct joycon_ctlr *ctlr)
+{
+	struct joycon_subcmd_request *req;
+	u8 buffer[sizeof(*req) + 1] = { 0 };
+	struct device *dev = &ctlr->sdev->dev;
+
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_SET_REPORT_MODE;
+	req->data[0] = 0x30; /* standard, full report mode */
+
+	dev_dbg(dev, "setting controller report mode\n");
+	return joycon_send_subcmd(ctlr, req, 1, HZ);
+}
+
+/* Taken from hid-nintendo.c */
+static int joycon_enable_imu(struct joycon_ctlr *ctlr, bool enable)
+{
+	struct joycon_subcmd_request *req;
+	u8 buffer[sizeof(*req) + 1] = { 0 };
+	struct device *dev = &ctlr->sdev->dev;
+
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_ENABLE_IMU;
+	req->data[0] = enable ? 0x01 : 0x00;
+
+	dev_dbg(dev, "%s IMU\n", enable ? "enabling" : "disabling");
+	return joycon_send_subcmd(ctlr, req, 1, HZ);
+}
+
 static s32 joycon_map_stick_val(struct joycon_stick_cal *cal, s32 val)
 {
 	s32 center = cal->center;
@@ -1101,6 +1140,224 @@ static s32 joycon_map_stick_val(struct joycon_stick_cal *cal, s32 val)
 	}
 	new_val = clamp(new_val, (s32)-JC_MAX_STICK_MAG, (s32)JC_MAX_STICK_MAG);
 	return new_val;
+}
+
+/* Taken from hid-nintendo.c */
+static void joycon_input_report_parse_imu_data(struct joycon_ctlr *ctlr,
+					       struct joycon_input_report *rep,
+					       struct joycon_imu_data *imu_data)
+{
+	u8 *raw = rep->imu_raw_bytes;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		struct joycon_imu_data *data = &imu_data[i];
+
+		data->accel_x = get_unaligned_le16(raw + 0);
+		data->accel_y = get_unaligned_le16(raw + 2);
+		data->accel_z = get_unaligned_le16(raw + 4);
+		data->gyro_x = get_unaligned_le16(raw + 6);
+		data->gyro_y = get_unaligned_le16(raw + 8);
+		data->gyro_z = get_unaligned_le16(raw + 10);
+		/* point to next imu sample */
+		raw += sizeof(struct joycon_imu_data);
+	}
+}
+
+/* Taken from hid-nintendo.c */
+static void joycon_parse_imu_report(struct joycon_ctlr *ctlr,
+				    struct joycon_input_report *rep)
+{
+	struct joycon_imu_data imu_data[3] = {0}; /* 3 reports per packet */
+	struct input_dev *idev = ctlr->imu_input;
+	struct device *dev = &ctlr->sdev->dev;
+	unsigned int msecs = jiffies_to_msecs(jiffies);
+	unsigned int last_msecs = ctlr->imu_last_pkt_ms;
+	int i;
+	int value[6];
+
+	joycon_input_report_parse_imu_data(ctlr, rep, imu_data);
+
+	/*
+	 * There are complexities surrounding how we determine the timestamps we
+	 * associate with the samples we pass to userspace. The IMU input
+	 * reports do not provide us with a good timestamp. There's a quickly
+	 * incrementing 8-bit counter per input report, but it is not very
+	 * useful for this purpose (it is not entirely clear what rate it
+	 * increments at or if it varies based on packet push rate - more on
+	 * the push rate below...).
+	 *
+	 * The reverse engineering work done on the joy-cons and pro controllers
+	 * by the community seems to indicate the following:
+	 * - The controller samples the IMU every 1.35ms. It then does some of
+	 *   its own processing, probably averaging the samples out.
+	 * - Each imu input report contains 3 IMU samples, (usually 5ms apart).
+	 * - In the standard reporting mode (which this driver uses exclusively)
+	 *   input reports are pushed from the controller as follows:
+	 *      * joy-con (bluetooth): every 15 ms
+	 *      * joy-cons (in charging grip via USB): every 15 ms
+	 *      * pro controller (USB): every 15 ms
+	 *      * pro controller (bluetooth): every 8 ms (this is the wildcard)
+	 *
+	 * Further complicating matters is that some bluetooth stacks are known
+	 * to alter the controller's packet rate by hardcoding the bluetooth
+	 * SSR for the switch controllers (android's stack currently sets the
+	 * SSR to 11ms for both the joy-cons and pro controllers).
+	 *
+	 * In my own testing, I've discovered that my pro controller either
+	 * reports IMU sample batches every 11ms or every 15ms. This rate is
+	 * stable after connecting. It isn't 100% clear what determines this
+	 * rate. Importantly, even when sending every 11ms, none of the samples
+	 * are duplicates. This seems to indicate that the time deltas between
+	 * reported samples can vary based on the input report rate.
+	 *
+	 * The solution employed in this driver is to keep track of the average
+	 * time delta between IMU input reports. In testing, this value has
+	 * proven to be stable, staying at 15ms or 11ms, though other hardware
+	 * configurations and bluetooth stacks could potentially see other rates
+	 * (hopefully this will become more clear as more people use the
+	 * driver).
+	 *
+	 * Keeping track of the average report delta allows us to submit our
+	 * timestamps to userspace based on that. Each report contains 3
+	 * samples, so the IMU sampling rate should be avg_time_delta/3. We can
+	 * also use this average to detect events where we have dropped a
+	 * packet. The userspace timestamp for the samples will be adjusted
+	 * accordingly to prevent unwanted behvaior.
+	 */
+	if (!ctlr->imu_first_packet_received) {
+		ctlr->imu_timestamp_us = 0;
+		ctlr->imu_delta_samples_count = 0;
+		ctlr->imu_delta_samples_sum = 0;
+		ctlr->imu_avg_delta_ms = JC_IMU_DFLT_AVG_DELTA_MS;
+		ctlr->imu_first_packet_received = true;
+	} else {
+		unsigned int delta = msecs - last_msecs;
+		unsigned int dropped_pkts;
+		unsigned int dropped_threshold;
+
+		/* avg imu report delta housekeeping */
+		ctlr->imu_delta_samples_sum += delta;
+		ctlr->imu_delta_samples_count++;
+		if (ctlr->imu_delta_samples_count >=
+		    JC_IMU_SAMPLES_PER_DELTA_AVG) {
+			ctlr->imu_avg_delta_ms = ctlr->imu_delta_samples_sum /
+						 ctlr->imu_delta_samples_count;
+			/* don't ever want divide by zero shenanigans */
+			if (ctlr->imu_avg_delta_ms == 0) {
+				ctlr->imu_avg_delta_ms = 1;
+				dev_warn(dev,
+					 "calculated avg imu delta of 0\n");
+			}
+			ctlr->imu_delta_samples_count = 0;
+			ctlr->imu_delta_samples_sum = 0;
+		}
+
+		/* useful for debugging IMU sample rate */
+		dev_dbg(dev,
+			"imu_report: ms=%u last_ms=%u delta=%u avg_delta=%u\n",
+			msecs, last_msecs, delta, ctlr->imu_avg_delta_ms);
+
+		/* check if any packets have been dropped */
+		dropped_threshold = ctlr->imu_avg_delta_ms * 3 / 2;
+		dropped_pkts = (delta - min(delta, dropped_threshold)) /
+				ctlr->imu_avg_delta_ms;
+		if (dropped_pkts > JC_IMU_DROPPED_PKT_WARNING) {
+			dev_info_ratelimited(dev,
+				 "compensating for %u dropped IMU reports\n"
+				 "delta=%u avg_delta=%u\n",
+				 dropped_pkts, delta, ctlr->imu_avg_delta_ms);
+		}
+	}
+	ctlr->imu_last_pkt_ms = msecs;
+
+	/* Each IMU input report contains three samples */
+	for (i = 0; i < 3; i++) {
+		input_event(idev, EV_MSC, MSC_TIMESTAMP,
+			    ctlr->imu_timestamp_us);
+
+		/*
+		 * These calculations (which use the controller's calibration
+		 * settings to improve the final values) are based on those
+		 * found in the community's reverse-engineering repo (linked at
+		 * top of driver). For hid-nintendo, we make sure that the final
+		 * value given to userspace is always in terms of the axis
+		 * resolution we provided.
+		 *
+		 * Currently only the gyro calculations subtract the calibration
+		 * offsets from the raw value itself. In testing, doing the same
+		 * for the accelerometer raw values decreased accuracy.
+		 *
+		 * Note that the gyro values are multiplied by the
+		 * precision-saving scaling factor to prevent large inaccuracies
+		 * due to truncation of the resolution value which would
+		 * otherwise occur. To prevent overflow (without resorting to 64
+		 * bit integer math), the mult_frac macro is used.
+		 */
+		value[0] = mult_frac((JC_IMU_PREC_RANGE_SCALE *
+				      (imu_data[i].gyro_x -
+				       ctlr->gyro_cal.offset[0])),
+				     ctlr->gyro_cal.scale[0],
+				     ctlr->imu_cal_gyro_divisor[0]);
+		value[1] = mult_frac((JC_IMU_PREC_RANGE_SCALE *
+				      (imu_data[i].gyro_y -
+				       ctlr->gyro_cal.offset[1])),
+				     ctlr->gyro_cal.scale[1],
+				     ctlr->imu_cal_gyro_divisor[1]);
+		value[2] = mult_frac((JC_IMU_PREC_RANGE_SCALE *
+				      (imu_data[i].gyro_z -
+				       ctlr->gyro_cal.offset[2])),
+				     ctlr->gyro_cal.scale[2],
+				     ctlr->imu_cal_gyro_divisor[2]);
+
+		value[3] = ((s32)imu_data[i].accel_x *
+			    ctlr->accel_cal.scale[0]) /
+			    ctlr->imu_cal_accel_divisor[0];
+		value[4] = ((s32)imu_data[i].accel_y *
+			    ctlr->accel_cal.scale[1]) /
+			    ctlr->imu_cal_accel_divisor[1];
+		value[5] = ((s32)imu_data[i].accel_z *
+			    ctlr->accel_cal.scale[2]) /
+			    ctlr->imu_cal_accel_divisor[2];
+
+		dev_dbg(dev, "raw_gyro: g_x=%hd g_y=%hd g_z=%hd\n",
+			imu_data[i].gyro_x, imu_data[i].gyro_y,
+			imu_data[i].gyro_z);
+		dev_dbg(dev, "raw_accel: a_x=%hd a_y=%hd a_z=%hd\n",
+			imu_data[i].accel_x, imu_data[i].accel_y,
+			imu_data[i].accel_z);
+
+		/*
+		 * The right joy-con has 2 axes negated, Y and Z. This is due to
+		 * the orientation of the IMU in the controller. We negate those
+		 * axes' values in order to be consistent with the left joy-con
+		 * and the pro controller:
+		 *   X: positive is pointing toward the triggers
+		 *   Y: positive is pointing to the left
+		 *   Z: positive is pointing up (out of the buttons/sticks)
+		 * The axes follow the right-hand rule.
+		 */
+		if (ctlr->ctlr_type == JOYCON_TYPE_RIGHT) {
+			int j;
+
+			/* negate all but x axis */
+			for (j = 1; j < 6; ++j) {
+				if (j == 3)
+					continue;
+				value[j] *= -1;
+			}
+		}
+
+		input_report_abs(idev, ABS_RX, value[0]);
+		input_report_abs(idev, ABS_RY, value[1]);
+		input_report_abs(idev, ABS_RZ, value[2]);
+		input_report_abs(idev, ABS_X, value[3]);
+		input_report_abs(idev, ABS_Y, value[4]);
+		input_report_abs(idev, ABS_Z, value[5]);
+		input_sync(idev);
+		/* convert to micros and divide by 3 (3 samples per report). */
+		ctlr->imu_timestamp_us += ctlr->imu_avg_delta_ms * 1000 / 3;
+	}
 }
 
 static void joycon_parse_report(struct joycon_ctlr *ctlr,
@@ -1260,6 +1517,9 @@ static void joycon_parse_report(struct joycon_ctlr *ctlr,
 	ctlr->received_input_report = true;
 	spin_unlock_irqrestore(&ctlr->lock, flags);
 	wake_up(&ctlr->wait);
+
+    if (rep->id == JC_INPUT_IMU_DATA && ctlr->imu_input)
+        joycon_parse_imu_report(ctlr, rep);
 }
 
 static void sio_input_report_parse_imu_data(struct joycon_ctlr *ctlr,
@@ -2111,11 +2371,94 @@ static void sio_set_imu_calibration(struct joycon_ctlr *ctlr)
 	}
 }
 
+/* Taken from hid-nintendo.c */
+static void joycon_calc_imu_cal_divisors(struct joycon_ctlr *ctlr)
+{
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		ctlr->imu_cal_accel_divisor[i] = ctlr->accel_cal.scale[i] -
+						ctlr->accel_cal.offset[i];
+		ctlr->imu_cal_gyro_divisor[i] = ctlr->gyro_cal.scale[i] -
+						ctlr->gyro_cal.offset[i];
+	}
+}
+
+/* Taken from hid-nintendo.c */
+static int joycon_request_imu_calibration(struct joycon_ctlr *ctlr)
+{
+    struct device *dev = &ctlr->sdev->dev;
+	u16 imu_cal_addr = JC_IMU_CAL_FCT_DATA_ADDR;
+	u8 *raw_cal;
+	int ret;
+	int i;
+
+	/* check if user calibration exists */
+	if (!joycon_check_for_cal_magic(ctlr, JC_IMU_CAL_USR_MAGIC_ADDR)) {
+		imu_cal_addr = JC_IMU_CAL_USR_DATA_ADDR;
+		dev_info(dev, "using user cal for IMU\n");
+	} else {
+		dev_info(dev, "using factory cal for IMU\n");
+	}
+
+	/* request IMU calibration data */
+	dev_dbg(dev, "requesting IMU cal data\n");
+	ret = joycon_request_spi_flash_read(ctlr, imu_cal_addr,
+					    JC_IMU_CAL_DATA_SIZE, &raw_cal);
+	if (ret) {
+		dev_warn(dev,
+			 "Failed to read IMU cal, using defaults; ret=%d\n",
+			 ret);
+
+		for (i = 0; i < 3; i++) {
+			ctlr->accel_cal.offset[i] = DFLT_ACCEL_OFFSET;
+			ctlr->accel_cal.scale[i] = DFLT_ACCEL_SCALE;
+			ctlr->gyro_cal.offset[i] = DFLT_GYRO_OFFSET;
+			ctlr->gyro_cal.scale[i] = DFLT_GYRO_SCALE;
+		}
+		joycon_calc_imu_cal_divisors(ctlr);
+		return ret;
+	}
+
+	/* IMU calibration parsing */
+	for (i = 0; i < 3; i++) {
+		int j = i * 2;
+
+		ctlr->accel_cal.offset[i] = get_unaligned_le16(raw_cal + j);
+		ctlr->accel_cal.scale[i] = get_unaligned_le16(raw_cal + j + 6);
+		ctlr->gyro_cal.offset[i] = get_unaligned_le16(raw_cal + j + 12);
+		ctlr->gyro_cal.scale[i] = get_unaligned_le16(raw_cal + j + 18);
+	}
+
+	joycon_calc_imu_cal_divisors(ctlr);
+
+	dev_dbg(dev, "IMU calibration:\n"
+			    "a_o[0]=%d a_o[1]=%d a_o[2]=%d\n"
+			    "a_s[0]=%d a_s[1]=%d a_s[2]=%d\n"
+			    "g_o[0]=%d g_o[1]=%d g_o[2]=%d\n"
+			    "g_s[0]=%d g_s[1]=%d g_s[2]=%d\n",
+			    ctlr->accel_cal.offset[0],
+			    ctlr->accel_cal.offset[1],
+			    ctlr->accel_cal.offset[2],
+			    ctlr->accel_cal.scale[0],
+			    ctlr->accel_cal.scale[1],
+			    ctlr->accel_cal.scale[2],
+			    ctlr->gyro_cal.offset[0],
+			    ctlr->gyro_cal.offset[1],
+			    ctlr->gyro_cal.offset[2],
+			    ctlr->gyro_cal.scale[0],
+			    ctlr->gyro_cal.scale[1],
+			    ctlr->gyro_cal.scale[2]);
+
+	return 0;
+}
+
 static int joycon_input_create(struct joycon_ctlr *ctlr)
 {
 	struct device *dev = &ctlr->sdev->dev;
 	enum joycon_ctlr_type type = ctlr->ctlr_type;
 	const char *name;
+    const char *imu_name;
 	u16 pid = 0;
 	int ret;
 	int i;
@@ -2123,14 +2466,17 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
 	switch (type) {
 	case JOYCON_TYPE_LEFT:
 		name = "Nintendo Switch Left Joy-Con Serial";
+		imu_name = "Nintendo Switch Left Joy-Con Serial IMU";
 		pid = 0x2006;
 		break;
 	case JOYCON_TYPE_RIGHT:
 		name = "Nintendo Switch Right Joy-Con Serial";
+		imu_name = "Nintendo Switch Right Joy-Con Serial IMU";
 		pid = 0x2007;
 		break;
 	case JOYCON_TYPE_SIO:
 		name = "Nintendo Switch Lite Gamepad";
+		imu_name = "Nintendo Switch Lite Gamepad IMU";
 		pid = 0xF123; /* Custom PID */
 		break;
 	default: /* Should be impossible */
@@ -2217,14 +2563,18 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
 	if (ret)
 		return ret;
 
-	if (ctlr->is_sio) {
+	if (!ctlr->is_hori) { /* assume hori is non-sio and non-joycon */
 		/* Configure the imu input device */
 		ctlr->imu_input = devm_input_allocate_device(dev);
 		if (!ctlr->imu_input)
 			return -ENOMEM;
 
+        if (!ctlr->is_sio)
+            ctlr->imu_first_packet_received = false;
+
 		/* Set calibration data */
-		sio_set_imu_calibration(ctlr);
+        if (ctlr->is_sio)
+		    sio_set_imu_calibration(ctlr);
 
 		ctlr->imu_input->dev.parent = dev;
 		ctlr->imu_input->id.bustype = BUS_VIRTUAL;
@@ -2232,7 +2582,7 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
 		ctlr->imu_input->id.product = pid;
 		ctlr->imu_input->id.version = 0;
 		ctlr->imu_input->uniq = ctlr->mac_addr_str;
-		ctlr->imu_input->name = "Nintendo Switch Lite Gamepad IMU";
+		ctlr->imu_input->name = imu_name;
 		input_set_drvdata(ctlr->imu_input, ctlr);
 
 		/* Configure imu axes */
@@ -2913,13 +3263,41 @@ static int joycon_post_handshake(struct joycon_ctlr *ctlr)
 			dev_warn(dev, "Analog stick positions may be inaccurate\n");
 		}
 
+		/* Get IMU calibration data, and parse it */
+		ret = joycon_request_imu_calibration(ctlr);
+		if (ret) {
+			/*
+			* We can function with default calibration, but it may be
+			* inaccurate. Provide a warning, and continue on.
+			*/
+			dev_warn(dev, "Unable to read IMU calibration data\n");
+		}
+
 		/* Enable rumble */
 		ret = joycon_enable_rumble(ctlr, true);
-		mutex_unlock(&ctlr->output_mutex);
 		if (ret) {
 			dev_err(dev, "Failed to enable rumble; ret=%d\n", ret);
+			mutex_unlock(&ctlr->output_mutex);
 			goto error;
 		}
+
+        /* Enable the IMU */
+        ret = joycon_enable_imu(ctlr, true);
+        if (ret) {
+            dev_err(dev, "Failed to enable the IMU; ret=%d\n", ret);
+			mutex_unlock(&ctlr->output_mutex);
+			goto error;
+        }
+
+        /* Set the reporting mode to 0x30, which is the full report mode */
+        ret = joycon_set_report_mode(ctlr);
+        if (ret) {
+            dev_err(dev, "Failed to set report mode; ret=%d\n", ret);
+			mutex_unlock(&ctlr->output_mutex);
+			goto error;
+        }
+
+		mutex_unlock(&ctlr->output_mutex);
 
 		/* Initialize the leds */
 		ret = joycon_leds_create(ctlr);
@@ -3119,7 +3497,18 @@ static int joycon_serdev_receive_buf(struct serdev_device *serdev,
 	if (ctlr->ctlr_state == JOYCON_CTLR_STATE_READ) {
 		if (packet->command == JC_CMD_EXTRET) {
 			dev_dbg(dev, "JC_CMD_EXTRET\n");
+
+            if (packet->size + 5 < sizeof(*packet) + 1)
+                return len;
+
 			r = (struct joycon_input_report *)packet->data;
+
+            if (r->id == JC_INPUT_IMU_DATA
+                && packet->size + 5 < sizeof(*packet) + sizeof(*r)) {
+                dev_warn(dev, "Received truncated IMU report\n");
+                return len;
+            }
+
 			if (r->id == JC_INPUT_SUBCMD_REPLY ||
 			    r->id == JC_INPUT_IMU_DATA ||
 			    r->id == JC_INPUT_MCU_DATA)
